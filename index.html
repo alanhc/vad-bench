@@ -801,7 +801,7 @@
     });
 
     runBtn.addEventListener("click", async () => {
-      const f = audioFileEl.files?.[0];
+      let f = audioFileEl.files?.[0];
       if (!f) {
         try {
           setStatus(`無選擇音檔，使用預設範例音檔 (audio.wav)...`);
