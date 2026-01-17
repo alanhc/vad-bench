@@ -600,34 +600,22 @@
 
     async function runWebRtcVad(int16k, frameMs, mode) {
       const mod = await loadWebRtcVad();
-      // Some versions export the class as default, others might be different.
-      // inspecting the library: https://www.npmjs.com/package/@ozymandiasthegreat/vad
-      // It seems it exports { VAD, VADEvent } usually.
-      // If using the 'embedded' one, it might be different.
-      // Let's try to handle both common patterns.
-
-      const VADClass = mod.VAD || mod.default;
-      if (!VADClass) throw new Error("VAD class not found in module");
-
-      // Check if it's a factory function or a class
-      let vadInst;
-      try {
-        // Attempt to instantiate
-        vadInst = new VADClass(Number(mode), CFG.TARGET_SR);
-      } catch (e) {
-        // If it fails, maybe it needs the async builder pattern (older versions)
-        // But based on error "is not a constructor", VADClass might be null or the builder function itself.
-        // Reverting to the logic: if there is a 'default' that is a function but not a class, it might be the builder
-
-        if (typeof mod.default === 'function' && !mod.VAD) {
-          const factory = mod.default;
-          await factory();
-          // After factory runs, maybe VAD is available globally or we use the factory result?
-          // Actually, for @ozymandiasthegreat/vad, the 'embedded' script typically sets a global or returns the module
-          // Let's look at a simpler fix: checking what keys are in 'mod'.
-        }
-        throw e;
+      // @ozymandiasthegreat/vad exports a default async factory function that returns the VAD class.
+      let VADClass;
+      if (typeof mod.default === "function") {
+        VADClass = await mod.default();
+      } else if (mod.VAD) {
+        VADClass = mod.VAD;
       }
+
+      if (!VADClass) {
+        throw new Error("Failed to load VAD class from module. keys: " + Object.keys(mod).join(", "));
+      }
+
+      const VADEvent = mod.VADEvent;
+
+      // Instantiate
+      const vadInst = new VADClass(Number(mode), CFG.TARGET_SR);
 
 
       const frameSamples = Math.round(CFG.TARGET_SR * (Number(frameMs) / 1000));
