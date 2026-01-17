@@ -981,7 +981,7 @@
             groundTruth: gtSegments ?? null,
             energy: { segments: energySegs },
             webrtc: { segments: webrtcSegs },
-            silero: { segments: sileroOut.segments }
+            silero: { segments: sileroOut ? sileroOut.segments : [] }
           }
         };
 
