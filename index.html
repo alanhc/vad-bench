@@ -805,7 +805,7 @@
       if (!f) {
         try {
           setStatus(`無選擇音檔，使用預設範例音檔 (audio.wav)...`);
-          const res = await fetch("audio.wav");
+          const res = await fetch("audio.wav?t=" + new Date().getTime());
           if (!res.ok) throw new Error("Default audio fetch failed");
           const blob = await res.blob();
           f = new File([blob], "audio.wav", { type: "audio/wav" });
