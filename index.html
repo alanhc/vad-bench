@@ -627,7 +627,9 @@
       const tStart = performance.now();
       for (let i = 0; i < nFrames; i++) {
         const off = i * frameSamples;
-        const frame = int16k.subarray(off, off + frameSamples);
+        // MUST copy to a new Int16Array so that frame.buffer is the correct size.
+        // The library uses new Uint8Array(frame.buffer) which fails if frame is a subarray.
+        const frame = new Int16Array(int16k.subarray(off, off + frameSamples));
 
         const t0 = performance.now();
         const ev = vadInst.processFrame(frame);
@@ -858,79 +860,106 @@
 
         const gtGrid = gtSegments ? segmentsToGrid(gtSegments, totalMs, CFG.GRID_MS) : null;
 
-        // Energy baseline
-        setStatus(`Running Energy baseline…`);
-        const tE0 = performance.now();
-        const energy = runEnergyVad(float16k, CFG.GRID_MS, energyThr, energyStartHang, energyEndHang);
-        const energySegs = segmentsFromFrameLabels(energy.labels, CFG.GRID_MS);
-        const tE1 = performance.now();
+        // --- Run Engines with error handling ---
+        let energy = null, energySegs = [];
+        let webrtcOut = null, webrtcSegs = [];
+        let sileroOut = null;
 
-        // WebRTC VAD
-        setStatus(`Running WebRTC VAD (mode=${mode}, frame=${frameMs}ms)…`);
-        const webrtcOut = await runWebRtcVad(int16k, frameMs, mode);
-        const webrtcSegs = segmentsFromFrameLabels(webrtcOut.labels, frameMs);
+        // 1. Energy
+        try {
+          setStatus(`Running Energy baseline…`);
+          const tE0 = performance.now();
+          energy = runEnergyVad(float16k, CFG.GRID_MS, energyThr, energyStartHang, energyEndHang);
+          energySegs = segmentsFromFrameLabels(energy.labels, CFG.GRID_MS);
+          energy.totalMs = performance.now() - tE0; // Add totalMs manually for consistency
+        } catch (e) {
+          console.error("Energy VAD failed:", e);
+        }
 
-        // Silero (NonRealTimeVAD)
-        setStatus(`Running Silero (vad-web NonRealTimeVAD)…`);
-        const sileroOut = await runSileroVad(float16k, CFG.TARGET_SR, {
-          pos: sileroPos,
-          neg: sileroNeg,
-          frameSamples: sileroFrameSamples,
-          minSpeechMs: sileroMinSpeechMs,
-          preSpeechPadMs: sileroPadMs,
-          redemptionMs: sileroRedeemMs,
-          gridMs: CFG.GRID_MS
-        });
+        // 2. WebRTC
+        try {
+          setStatus(`Running WebRTC VAD (mode=${mode}, frame=${frameMs}ms)…`);
+          webrtcOut = await runWebRtcVad(int16k, frameMs, mode);
+          webrtcSegs = segmentsFromFrameLabels(webrtcOut.labels, frameMs);
+        } catch (e) {
+          console.error("WebRTC VAD failed:", e);
+        }
 
-        // Metrics
+        // 3. Silero
+        try {
+          setStatus(`Running Silero (vad-web NonRealTimeVAD)…`);
+          sileroOut = await runSileroVad(float16k, CFG.TARGET_SR, {
+            pos: sileroPos,
+            neg: sileroNeg,
+            frameSamples: sileroFrameSamples,
+            minSpeechMs: sileroMinSpeechMs,
+            preSpeechPadMs: sileroPadMs,
+            redemptionMs: sileroRedeemMs,
+            gridMs: CFG.GRID_MS
+          });
+        } catch (e) {
+          console.error("Silero VAD failed:", e);
+        }
+
+        // --- Metrics & Timeline ---
         const audioDurSec = float16k.length / CFG.TARGET_SR;
+        clearMetrics(); // Helper to clear table if exists, or just append. 
+        // Note: Existing code clears table at start? No, it appends. 
+        // We probably want to keep appending but handle missing data.
 
-        const energyStats = frameTimesStats(energy.frameTimes);
-        const webrtcStats = frameTimesStats(webrtcOut.frameTimes);
+        // Energy Rows
+        if (energy) {
+          const energyStats = frameTimesStats(energy.frameTimes);
+          const energyPrf = gtGrid ? prf1(segmentsToGrid(energySegs, totalMs, CFG.GRID_MS), gtGrid) : null;
+          addMetricRow({
+            name: "Energy baseline",
+            totalMs: energy.totalMs,
+            rtf: energy.totalMs / (audioDurSec * 1000),
+            segments: energySegs.length,
+            speechSec: sumSpeechSeconds(energySegs),
+            p50: energyStats.p50,
+            p95: energyStats.p95,
+            prf: energyPrf
+          });
+        }
 
-        const energyPrf = gtGrid ? prf1(segmentsToGrid(energySegs, totalMs, CFG.GRID_MS), gtGrid) : null;
-        const webrtcPrf = gtGrid ? prf1(segmentsToGrid(webrtcSegs, totalMs, CFG.GRID_MS), gtGrid) : null;
-        const sileroPrf = gtGrid ? prf1(sileroOut.labels, gtGrid) : null;
+        // WebRTC Rows
+        if (webrtcOut) {
+          const webrtcStats = frameTimesStats(webrtcOut.frameTimes);
+          const webrtcPrf = gtGrid ? prf1(segmentsToGrid(webrtcSegs, totalMs, CFG.GRID_MS), gtGrid) : null;
+          addMetricRow({
+            name: `WebRTC VAD (mode=${mode}, ${frameMs}ms)`,
+            totalMs: webrtcOut.totalMs,
+            rtf: webrtcOut.totalMs / (audioDurSec * 1000),
+            segments: webrtcSegs.length,
+            speechSec: sumSpeechSeconds(webrtcSegs),
+            p50: webrtcStats.p50,
+            p95: webrtcStats.p95,
+            prf: webrtcPrf
+          });
+        }
 
-        addMetricRow({
-          name: "Energy baseline",
-          totalMs: tE1 - tE0,
-          rtf: (tE1 - tE0) / (audioDurSec * 1000),
-          segments: energySegs.length,
-          speechSec: sumSpeechSeconds(energySegs),
-          p50: energyStats.p50,
-          p95: energyStats.p95,
-          prf: energyPrf
-        });
+        // Silero Rows
+        if (sileroOut) {
+          const sileroPrf = gtGrid ? prf1(sileroOut.labels, gtGrid) : null;
+          addMetricRow({
+            name: `Silero (vad-web NonRealTimeVAD)`,
+            totalMs: sileroOut.totalMs,
+            rtf: sileroOut.totalMs / (audioDurSec * 1000),
+            segments: sileroOut.segments.length,
+            speechSec: sumSpeechSeconds(sileroOut.segments),
+            p50: NaN,
+            p95: NaN,
+            prf: sileroPrf
+          });
+        }
 
-        addMetricRow({
-          name: `WebRTC VAD (mode=${mode}, ${frameMs}ms)`,
-          totalMs: webrtcOut.totalMs,
-          rtf: webrtcOut.totalMs / (audioDurSec * 1000),
-          segments: webrtcSegs.length,
-          speechSec: sumSpeechSeconds(webrtcSegs),
-          p50: webrtcStats.p50,
-          p95: webrtcStats.p95,
-          prf: webrtcPrf
-        });
-
-        addMetricRow({
-          name: `Silero (vad-web NonRealTimeVAD)`,
-          totalMs: sileroOut.totalMs,
-          rtf: sileroOut.totalMs / (audioDurSec * 1000),
-          segments: sileroOut.segments.length,
-          speechSec: sumSpeechSeconds(sileroOut.segments),
-          p50: NaN,
-          p95: NaN,
-          prf: sileroPrf
-        });
-
-        // Timeline rows
+        // Timeline
         const rows = [];
         if (gtSegments) rows.push({ name: "GT", segments: gtSegments, color: "rgba(255,255,255,0.65)" });
-        rows.push({ name: "Energy", segments: energySegs, color: "rgba(253,176,34,0.85)" });
-        rows.push({ name: "WebRTC", segments: webrtcSegs, color: "rgba(50,213,131,0.85)" });
-        rows.push({ name: "Silero", segments: sileroOut.segments, color: "rgba(96,165,250,0.85)" });
+        if (energy) rows.push({ name: "Energy", segments: energySegs, color: "rgba(253,176,34,0.85)" });
+        if (webrtcOut) rows.push({ name: "WebRTC", segments: webrtcSegs, color: "rgba(50,213,131,0.85)" });
+        if (sileroOut) rows.push({ name: "Silero", segments: sileroOut.segments, color: "rgba(96,165,250,0.85)" });
 
         drawTimeline(rows, totalMs);
 
